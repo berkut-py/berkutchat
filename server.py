@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Berkut Messenger Server v1.0
-Flask + WebSocket сервер
+Berkut Messenger Server v2.0
+Flask + HTTP Polling (без WebSocket — работает на RelaxDev)
 """
 import os
 import json
@@ -9,7 +9,6 @@ import time
 import threading
 from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory
-from flask_sock import Sock
 
 # ============================================================
 # КОНФИГ
@@ -27,7 +26,6 @@ for d in [HISTORY_DIR, UPLOADS_DIR]:
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
-sock = Sock(app)
 
 # ============================================================
 # ХРАНИЛИЩЕ
@@ -35,7 +33,7 @@ sock = Sock(app)
 users = {}
 rooms = {}
 history = {}
-connections = {}
+poll_queues = {}  # {name: {"queue": [], "last_seen": timestamp}}
 lock = threading.Lock()
 
 
@@ -104,27 +102,18 @@ def now_str():
     return datetime.now().strftime("%H:%M:%S")
 
 
-def broadcast(data, room_id=None, exclude=None):
-    to_remove = []
-    for ws, info in list(connections.items()):
-        if ws is exclude:
-            continue
-        if room_id and room_id not in info.get("rooms", []):
-            continue
-        try:
-            ws.send(json.dumps(data, ensure_ascii=False))
-        except Exception:
-            to_remove.append(ws)
-    for ws in to_remove:
-        if ws in connections:
-            del connections[ws]
+def push_to_all(msg):
+    """Кладёт сообщение в очередь всех пользователей"""
+    with lock:
+        for u in poll_queues:
+            poll_queues[u]["queue"].append(msg)
 
 
-def send_to(ws, data):
-    try:
-        ws.send(json.dumps(data, ensure_ascii=False))
-    except Exception:
-        pass
+def push_to_user(name, msg):
+    with lock:
+        if name not in poll_queues:
+            poll_queues[name] = {"queue": [], "last_seen": time.time()}
+        poll_queues[name]["queue"].append(msg)
 
 
 # ============================================================
@@ -135,8 +124,8 @@ def index():
     return jsonify({
         "status": "online",
         "name": "Berkut Messenger Server",
-        "version": "1.0",
-        "users_online": len(connections),
+        "version": "2.0-polling",
+        "users_online": len(poll_queues),
         "users_total": len(users),
         "rooms_total": len(rooms),
     })
@@ -168,7 +157,124 @@ def login():
         return jsonify({"ok": False, "error": "Пользователь не найден"}), 401
     if users[name]["password"] != password:
         return jsonify({"ok": False, "error": "Неверный пароль"}), 401
+    # Регистрируем в очереди
+    with lock:
+        poll_queues[name] = {"queue": [], "last_seen": time.time()}
+    # Оповещаем всех что зашёл
+    push_to_all({"type": "system", "message": name + " присоединился", "time": now_str()})
     return jsonify({"ok": True, "name": name, "avatar": users[name].get("avatar", "👤")})
+
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    data = request.get_json()
+    name = data.get("name", "").strip()
+    with lock:
+        if name in poll_queues:
+            del poll_queues[name]
+    push_to_all({"type": "system", "message": name + " покинул чат", "time": now_str()})
+    return jsonify({"ok": True})
+
+
+@app.route("/poll/send", methods=["POST"])
+def poll_send():
+    data = request.get_json()
+    name = data.get("name", "").strip()
+    password = data.get("password", "")
+    if name not in users or users[name]["password"] != password:
+        return jsonify({"ok": False, "error": "Неверный логин"}), 401
+
+    msg_type = data.get("type", "message")
+    room = data.get("room", "general")
+    text = data.get("text", "").strip()
+    target = data.get("to", "")
+
+    # Обновляем last_seen
+    with lock:
+        if name in poll_queues:
+            poll_queues[name]["last_seen"] = time.time()
+
+    if msg_type == "message":
+        if not text:
+            return jsonify({"ok": False, "error": "Пустое сообщение"})
+        msg = {
+            "type": "message", "from": name, "avatar": users[name].get("avatar", "👤"),
+            "text": text, "time": now_str(), "room": room,
+        }
+        add_to_history(room, msg)
+        push_to_all(msg)
+        return jsonify({"ok": True})
+
+    elif msg_type == "dm":
+        if not text or target not in users:
+            return jsonify({"ok": False, "error": "Неверный получатель"})
+        msg = {
+            "type": "dm", "from": name, "to": target,
+            "avatar": users[name].get("avatar", "👤"),
+            "text": text, "time": now_str(),
+        }
+        push_to_user(name, msg)
+        push_to_user(target, msg)
+        return jsonify({"ok": True})
+
+    elif msg_type == "create_room":
+        room_name = data.get("room_name", "").strip()
+        rtype = data.get("room_type", "text")
+        private = data.get("private", False)
+        password_r = data.get("password", "")
+        if not room_name:
+            return jsonify({"ok": False, "error": "Нет названия"})
+        with lock:
+            rid = "room_" + str(int(time.time() * 1000))
+            rooms[rid] = {
+                "id": rid, "name": room_name, "type": rtype,
+                "private": private, "password": password_r,
+                "members": [name], "owner": name,
+            }
+            save_rooms()
+            history[rid] = []
+            save_history(rid)
+        push_to_all({"type": "rooms_update", "rooms": rooms})
+        return jsonify({"ok": True, "id": rid})
+
+    return jsonify({"ok": False, "error": "Неизвестный тип"})
+
+
+@app.route("/poll/get", methods=["POST"])
+def poll_get():
+    """Клиент дёргает каждую секунду — отдаём новые сообщения"""
+    data = request.get_json()
+    name = data.get("name", "").strip()
+    password = data.get("password", "")
+    if name not in users or users[name]["password"] != password:
+        return jsonify({"ok": False, "error": "Неверный логин"}), 401
+
+    with lock:
+        if name not in poll_queues:
+            poll_queues[name] = {"queue": [], "last_seen": time.time()}
+        queue = poll_queues[name]["queue"]
+        poll_queues[name]["queue"] = []
+        poll_queues[name]["last_seen"] = time.time()
+        online = list(poll_queues.keys())
+
+    return jsonify({
+        "ok": True,
+        "messages": queue,
+        "online": online,
+        "rooms": rooms,
+    })
+
+
+@app.route("/poll/history", methods=["POST"])
+def poll_history():
+    """История конкретной комнаты"""
+    data = request.get_json()
+    name = data.get("name", "").strip()
+    password = data.get("password", "")
+    room = data.get("room", "general")
+    if name not in users or users[name]["password"] != password:
+        return jsonify({"ok": False, "error": "Неверный логин"}), 401
+    return jsonify({"ok": True, "messages": history.get(room, [])})
 
 
 @app.route("/rooms/list", methods=["GET"])
@@ -176,8 +282,8 @@ def rooms_list():
     result = []
     for rid, r in rooms.items():
         if not r.get("private"):
-            online = sum(1 for i in connections.values() if rid in i.get("rooms", []))
-            result.append({"id": rid, "name": r["name"], "type": r["type"], "online": online})
+            online = sum(1 for u in poll_queues if True)
+            result.append({"id": rid, "name": r["name"], "type": r["type"], "online": 0})
     return jsonify(result)
 
 
@@ -204,116 +310,12 @@ def get_upload(filename):
 
 
 # ============================================================
-# WEBSOCKET
-# ============================================================
-@sock.route("/ws")
-def ws_handler(ws):
-    name = None
-    try:
-        while True:
-            raw = ws.receive()
-            if not raw:
-                break
-            try:
-                data = json.loads(raw)
-            except Exception:
-                continue
-            action = data.get("action")
-
-            if action == "join":
-                join_name = data.get("name", "").strip()
-                password = data.get("password", "")
-                if join_name not in users or users[join_name]["password"] != password:
-                    send_to(ws, {"type": "error", "message": "Неверный логин"})
-                    break
-                name = join_name
-                connections[ws] = {"name": name, "rooms": ["general"]}
-                send_to(ws, {
-                    "type": "joined", "name": name,
-                    "rooms": rooms, "history": history.get("general", []),
-                })
-                broadcast({"type": "system", "message": name + " присоединился", "time": now_str()})
-                broadcast({"type": "online", "users": [i["name"] for i in connections.values()]})
-                continue
-
-            if action == "message":
-                room_id = data.get("room", "general")
-                text = data.get("text", "")
-                if not text.strip():
-                    continue
-                msg = {
-                    "from": name, "avatar": users[name].get("avatar", "👤"),
-                    "text": text, "time": now_str(), "room": room_id,
-                }
-                add_to_history(room_id, msg)
-                broadcast({"type": "message", **msg}, room_id=room_id)
-                continue
-
-            if action == "dm":
-                target = data.get("to", "")
-                text = data.get("text", "")
-                if not text.strip() or target not in users:
-                    continue
-                msg = {
-                    "from": name, "to": target,
-                    "avatar": users[name].get("avatar", "👤"),
-                    "text": text, "time": now_str(),
-                }
-                for w, info in list(connections.items()):
-                    if info["name"] in (name, target):
-                        send_to(w, {"type": "dm", **msg})
-                continue
-
-            if action == "switch_room":
-                room_id = data.get("room", "general")
-                if ws in connections and room_id not in connections[ws]["rooms"]:
-                    connections[ws]["rooms"].append(room_id)
-                send_to(ws, {"type": "history", "room": room_id, "messages": history.get(room_id, [])})
-                continue
-
-            if action == "create_room":
-                room_name = data.get("name", "").strip()
-                rtype = data.get("type", "text")
-                private = data.get("private", False)
-                password = data.get("password", "")
-                if not room_name:
-                    continue
-                with lock:
-                    rid = "room_" + str(int(time.time() * 1000))
-                    rooms[rid] = {
-                        "id": rid, "name": room_name, "type": rtype,
-                        "private": private, "password": password,
-                        "members": [name], "owner": name,
-                    }
-                    save_rooms()
-                    history[rid] = []
-                    save_history(rid)
-                if ws in connections:
-                    connections[ws]["rooms"].append(rid)
-                broadcast({"type": "rooms_update", "rooms": rooms})
-                continue
-
-            if action == "ping":
-                send_to(ws, {"type": "pong"})
-                continue
-
-    except Exception as e:
-        print("[WS] " + str(e))
-    finally:
-        if ws in connections:
-            info = connections[ws]
-            del connections[ws]
-            broadcast({"type": "system", "message": info["name"] + " покинул чат", "time": now_str()})
-            broadcast({"type": "online", "users": [i["name"] for i in connections.values()]})
-
-
-# ============================================================
 # ЗАПУСК
 # ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print("=" * 60)
-    print("Berkut Messenger Server")
+    print("Berkut Messenger Server v2.0 (POLLING)")
     print("=" * 60)
     print("Порт: " + str(port))
     print("Пользователей: " + str(len(users)))
