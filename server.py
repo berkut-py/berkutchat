@@ -30,7 +30,7 @@ STICKERS_DIR = os.path.join(BASE_DIR, "stickers")
 PACKS_DIR = os.path.join(STICKERS_DIR, "packs")
 UPLOADS_META = os.path.join(BASE_DIR, "uploads_meta.json")
 
-MAX_HISTORY = 200
+MAX_HISTORY = 999999999  # Практически без лимита
 MAX_FILE_SIZE = 100 * 1024 * 1024 * 1024
 CHUNK_SIZE = 75 * 1024 * 1024
 CHUNK_TTL_HOURS = 24
@@ -531,8 +531,7 @@ def send_sticker():
     if room not in history:
         history[room] = []
     history[room].append(msg)
-    if len(history[room]) > MAX_HISTORY:
-        history[room] = history[room][-MAX_HISTORY:]
+    # Лимит убран — сохраняем всё
     save_history(room)
 
     push_broadcast(msg)
@@ -837,8 +836,7 @@ def upload_finish():
     if room not in history:
         history[room] = []
     history[room].append(msg)
-    if len(history[room]) > MAX_HISTORY:
-        history[room] = history[room][-MAX_HISTORY:]
+    # Лимит убран — сохраняем всё
     save_history(room)
     push_broadcast(msg)
     return jsonify({"ok": True, "file_url": msg["file_url"], "msg_id": msg_id})
@@ -898,8 +896,7 @@ def send():
     if room not in history:
         history[room] = []
     history[room].append(msg)
-    if len(history[room]) > MAX_HISTORY:
-        history[room] = history[room][-MAX_HISTORY:]
+    # Лимит убран — сохраняем всё
     save_history(room)
     push_broadcast(msg)
     return jsonify({"ok": True, "msg_id": msg_id})
@@ -1103,3 +1100,4 @@ if __name__ == "__main__":
     print("НОВОЕ: /profile/set_frame — админ выдаёт рамки")
     print("=" * 60)
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+    
