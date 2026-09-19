@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+packs/
+users.json
+rooms.json
+reactions.json
+uploads_meta.json
+history/
+chunks/
+uploads/
+backups/
